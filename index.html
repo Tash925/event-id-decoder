@@ -1,0 +1,995 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <title>Event ID Decoder</title>
+  <script>
+    /* Event catalog. Add an object to this array to extend the decoder.
+       Fields: id, name, source, category, severity, explanation, why
+       source: "Security" | "System" | "PowerShell"
+       severity: "Info" | "Watch" | "High"
+       Optional: logonTypes: [{ type, name, note? }, ...]
+                 statusCodes: [{ code, meaning }, ...], statusNote
+                 related: [eventId, ...]
+       Cards render in numeric order by id. */
+    const EVENTS = [
+      {
+        id: 4624,
+        name: "An account was successfully logged on",
+        source: "Security",
+        category: "Logon",
+        severity: "Info",
+        explanation: "Windows recorded a successful authentication. The Logon Type field says how the session was opened. The Logon ID identifies this session in later events.",
+        logonTypes: [
+          { type: 2, name: "Interactive" },
+          { type: 3, name: "Network" },
+          { type: 4, name: "Batch" },
+          { type: 5, name: "Service" },
+          { type: 7, name: "Unlock" },
+          { type: 8, name: "NetworkCleartext", note: "Type 8 means credentials crossed the network in cleartext." },
+          { type: 9, name: "NewCredentials", note: "Type 9 is created by the legitimate runas /netonly command, but pass-the-hash tools like Mimikatz also generate it, so a type 9 on a regular user’s workstation deserves a closer look." },
+          { type: 10, name: "RemoteInteractive (RDP)" },
+          { type: 11, name: "CachedInteractive" }
+        ],
+        why: "This is the baseline of who got in. Check the account, source IP, and workstation. Escalate a type 10 from an unusual host, a type 9 from a normal user box, or a service account doing an interactive logon. Pair the Logon ID with 4672 if you need to know whether the session was privileged."
+      },
+      {
+        id: 4625,
+        name: "An account failed to log on",
+        source: "Security",
+        category: "Logon",
+        severity: "Watch",
+        explanation: "An authentication attempt was rejected. Status and Sub Status say why. Status is often the generic 0xC000006D; the specific reason is usually in Sub Status.",
+        statusCodes: [
+          { code: "0xC000006A", meaning: "Wrong password" },
+          { code: "0xC0000064", meaning: "Username doesn’t exist" },
+          { code: "0xC0000234", meaning: "Account locked out" },
+          { code: "0xC0000072", meaning: "Account disabled" },
+          { code: "0xC000006F", meaning: "Logon outside allowed hours" },
+          { code: "0xC0000071", meaning: "Password expired" }
+        ],
+        statusNote: "Password spraying: 0xC000006A spread across many different accounts, only a few attempts each, to stay under the lockout threshold. Username guessing: many 0xC0000064 across different usernames. Brute force: many 0xC000006A on one account, often ending in 4740.",
+        related: [4624, 4740],
+        why: "A few failures are users mistyping a password. Escalate when failures are followed by a 4624 success for the same account (the guess worked), when they target admin or disabled accounts, or when they come from external IPs or RDP (logon type 10). When this is logged on a domain controller, the DC is just recording the attempt; use Workstation Name and Source Network Address to find where it came from."
+      },
+      {
+        id: 4634,
+        name: "An account was logged off",
+        source: "Security",
+        category: "Logon",
+        severity: "Info",
+        explanation: "A logon session ended and Windows tore it down. Network logons (type 3) often never write a matching 4634, so a missing logoff is normal for file, share, and LDAP access.",
+        why: "Use the Logon ID to join this event to the 4624 that opened the session and measure how long it lasted. Useful once you already have a session of interest. Weak as a hunt by itself."
+      },
+      {
+        id: 4647,
+        name: "User initiated logoff",
+        source: "Security",
+        category: "Logon",
+        severity: "Info",
+        explanation: "The person in the session chose Log off. 4634 also covers sessions the system closed on its own; 4647 is specifically a user-initiated interactive logoff.",
+        why: "On a shared workstation or jump box, this separates someone ending their own session from a timeout, a reboot, or a session that was killed. Correlate with the surrounding 4624 and 4634 by time and Logon ID."
+      },
+      {
+        id: 4648,
+        name: "A logon was attempted using explicit credentials",
+        source: "Security",
+        category: "Logon",
+        severity: "Watch",
+        explanation: "A process supplied a username and secret to authenticate as a particular account. RunAs, net use with a password, scheduled tasks that store credentials, and a lot of remote administration tools all produce it. The event names the caller process, the account that was offered, and the target server.",
+        why: "This is a common lateral-movement artifact. A user workstation firing 4648 at many hosts, or a process you do not recognize offering a privileged account, is a pivot. Compare the target account with a normal 4624 for that same destination."
+      },
+      {
+        id: 4672,
+        name: "Special privileges assigned to new logon",
+        source: "Security",
+        category: "Logon",
+        severity: "Watch",
+        explanation: "The new logon was given high privileges such as SeDebugPrivilege, SeBackupPrivilege, SeTakeOwnershipPrivilege, SeLoadDriverPrivilege, or SeTcbPrivilege. LocalSystem and members of Administrators receive this on nearly every logon, so the event is noisy on domain controllers and admin workstations.",
+        why: "Expected for admins and SYSTEM. Worth the ticket when a standard user, a service account, or a brand-new account gets it. Read the privilege list, then open the 4624 with the same Logon ID to see who actually authenticated."
+      },
+      {
+        id: 4688,
+        name: "A new process has been created",
+        source: "Security",
+        category: "Process",
+        severity: "Info",
+        explanation: "Process-creation auditing recorded a process start: the new process, its parent, and the user. The command line is included only when “Include command line in process creation events” is enabled along with Audit Process Creation. Without that policy the event is a name and a parent, which is much weaker.",
+        why: "This is how you see living-off-the-land binaries: powershell.exe, cmd.exe, rundll32.exe, mshta.exe, wscript.exe, certutil.exe. The useful signal is parent and child plus the command line — Office spawning a shell, or a user process launching whoami, nltest, or an encoded command. Volume is too high to alert on the ID alone."
+      },
+      {
+        id: 4697,
+        name: "A service was installed in the system",
+        source: "Security",
+        category: "Persistence",
+        severity: "High",
+        explanation: "A service was registered with the Service Control Manager and the Security log recorded it. You get the service name, the start type, the account it runs as, and the binary path. It is written only when the relevant security auditing is on; many networks never see it.",
+        why: "A new service is a standard way to keep execution across reboots and to run as LocalSystem. Investigate a binary under Temp, AppData, or a share, and any service name you cannot tie to a change. When 4697 is missing, check System event 7045 on the same host — the SCM often logs the install there anyway."
+      },
+      {
+        id: 4698,
+        name: "A scheduled task was created",
+        source: "Security",
+        category: "Persistence",
+        severity: "High",
+        explanation: "Someone registered a scheduled task. The Security event carries the task name and the account that created it. The program, arguments, and trigger live in the task XML, which may be only partly reflected in the event text.",
+        why: "Scheduled tasks survive reboot and run as a chosen account, which makes them a favorite persistence mechanism. Look harder at tasks created outside change windows, tasks whose action is powershell.exe or a script in a user-writable path, and names that imitate Windows tasks. Note who the author account was."
+      },
+      {
+        id: 4719,
+        name: "System audit policy was changed",
+        source: "Security",
+        category: "Defense Evasion",
+        severity: "High",
+        explanation: "A subcategory of audit policy was changed. Success or failure auditing was turned on or off for an area such as logon, process creation, or account management. The subject account is who made the change, and the event records the old and new settings.",
+        why: "People who already have admin rights clear their tracks by turning auditing off before the next step. Any 4719 outside a known GPO rollout deserves a look. See which subcategory flipped, whether success auditing was removed, and what that account did in the minutes after."
+      },
+      {
+        id: 4720,
+        name: "A user account was created",
+        source: "Security",
+        category: "Account Management",
+        severity: "High",
+        explanation: "A local or domain user was created. The subject is who created it; the target is the new account. Domain accounts are logged on a domain controller. Local accounts are logged on the member where they were created.",
+        why: "An unexpected account is both persistence and a way back in after a stolen password is reset. Check the creator, then look immediately afterward for 4722 (enabled) and for a group add — 4728, 4732, or 4756 — that would hand the new account real privilege."
+      },
+      {
+        id: 4722,
+        name: "A user account was enabled",
+        source: "Security",
+        category: "Account Management",
+        severity: "High",
+        explanation: "An account that was disabled is now enabled. The subject performed the change. The target is the account that can log on again.",
+        why: "Re-enabling a stale account is a quiet way in: the account already exists, so it may not match a “new user” alert. Treat it as hostile until you recognize the ticket when the target is a former admin, a disabled service account, or anyone turned off during a previous incident."
+      },
+      {
+        id: 4724,
+        name: "An attempt was made to reset an account's password",
+        source: "Security",
+        category: "Account Management",
+        severity: "High",
+        explanation: "Someone reset another account’s password. This is a reset performed by a second party. A person changing their own password is 4723, which is a different event and usually benign.",
+        why: "The person who resets the password knows the new one. Prioritize resets of privileged or service accounts, resets done by an account that does not normally manage users, and a reset followed by a 4624 for the target from a host that account does not use."
+      },
+      {
+        id: 4725,
+        name: "A user account was disabled",
+        source: "Security",
+        category: "Account Management",
+        severity: "Watch",
+        explanation: "An account was disabled and cannot authenticate until someone enables it again with a 4722. The subject is who disabled it; the target is the account.",
+        why: "Help desks do this every day. It still matters when many accounts are disabled together, when an admin or service account is disabled just before other suspicious activity, or when an operator account disappears in the middle of an incident response."
+      },
+      {
+        id: 4726,
+        name: "A user account was deleted",
+        source: "Security",
+        category: "Account Management",
+        severity: "High",
+        explanation: "A user account was deleted. The subject performed the deletion. The target account is gone, along with the ability to attribute future activity to it by name alone.",
+        why: "Deletion is how access gets removed during a destructive attack, and it is also how an added-then-used backdoor account disappears. Unexpected deletes of admin or service accounts need the subject, the timestamp, and any group changes in the same minute."
+      },
+      {
+        id: 4728,
+        name: "A member was added to a security-enabled global group",
+        source: "Security",
+        category: "Account Management",
+        severity: "High",
+        explanation: "A member was added to a security-enabled global group. On a domain controller this is the event for groups such as Domain Admins. The member, the group, and the account that made the change are all in the event.",
+        why: "Group membership is the privilege. An add to Domain Admins or another tier-0 group is an incident until a change record explains it. Follow the new member’s 4624s and see whether 4720 created that account moments earlier."
+      },
+      {
+        id: 4732,
+        name: "A member was added to a security-enabled local group",
+        source: "Security",
+        category: "Account Management",
+        severity: "High",
+        explanation: "A member was added to a local security group on this computer. The groups that change an investigation are Administrators, Backup Operators, Remote Desktop Users, and Remote Management Users. This logs on the machine where the group lives, which for domain-local groups is a domain controller.",
+        why: "Local Administrators is local persistence and the usual launchpad for credential dumping. The same domain account added to Administrators on many workstations is a classic post-exploitation pattern. If you also see a removal, check 4733 — that pair is sometimes used to hide a short-lived add."
+      },
+      {
+        id: 4740,
+        name: "A user account was locked out",
+        source: "Security",
+        category: "Account Management",
+        severity: "Watch",
+        explanation: "Bad passwords crossed the lockout threshold. The account cannot log on until it is unlocked or the lockout duration expires. Caller Computer Name is the machine that delivered the failing attempts, which is often not the domain controller that wrote the event.",
+        why: "One lockout is usually a person or a stale mapped drive. Many accounts locked from the same caller is password spray. The same account locking over and over from one workstation is a script or an attacker stuck on a guess. Start with the caller computer, then look there for 4625 and 4771."
+      },
+      {
+        id: 4756,
+        name: "A member was added to a security-enabled universal group",
+        source: "Security",
+        category: "Account Management",
+        severity: "High",
+        explanation: "A member was added to a security-enabled universal group. Enterprise Admins and Schema Admins are universal; membership applies across the forest, not just one domain. The event is written on a domain controller.",
+        why: "This is one of the highest-signal account changes in Active Directory. An unexplained add to Enterprise Admins or Schema Admins is tier-0 compromise until proven otherwise. Record the member, the group, and the subject account, and assume the subject’s credentials are in play."
+      },
+      {
+        id: 4768,
+        name: "A Kerberos authentication ticket (TGT) was requested",
+        source: "Security",
+        category: "Kerberos",
+        severity: "Watch",
+        explanation: "A client asked a domain controller for a ticket-granting ticket. Result code 0x0 is success. Common result codes: 0x6 unknown principal, 0x12 account revoked (disabled, expired, or locked), 0x17 password expired, 0x18 pre-authentication failed (bad password), 0x25 clock skew. Ticket encryption type is a separate field: 0x12 means AES-256 and 0x17 means RC4-HMAC. The client address is where the request came from.",
+        why: "Successful TGTs are ordinary domain traffic. 0x18 failures spread across many accounts are Kerberos password spray. RC4 requested for an account that should be AES-only, or a TGT issued without pre-authentication, is the AS-REP roasting case. Do not treat every 4768 as an alert — pivot on result code, encryption type, and client address."
+      },
+      {
+        id: 4769,
+        name: "A Kerberos service ticket was requested",
+        source: "Security",
+        category: "Kerberos",
+        severity: "Watch",
+        explanation: "A client that already has a TGT asked a domain controller for a service ticket to a specific service principal. Ticket encryption type 0x17 means the service ticket was RC4. The service name, client address, and ticket options are in the event. Every normal Kerberos connection to a service produces one.",
+        why: "Kerberoasting looks like many 4769s, from one workstation, in a short window, asking for RC4 tickets for user-based SPNs such as SQL or HTTP service accounts. A single 4769 is not the technique. The pattern is volume, RC4 (0x17), and which SPNs were requested."
+      },
+      {
+        id: 4771,
+        name: "Kerberos pre-authentication failed",
+        source: "Security",
+        category: "Kerberos",
+        severity: "Watch",
+        explanation: "A domain controller rejected Kerberos pre-authentication. Failure code 0x18 is a bad password. 0x6 means the client principal was not found. 0x12 means the account is revoked, which includes disabled accounts. The client address is the source of the attempt.",
+        why: "This is the Kerberos companion to a bad-password 4625, and it shows up even when the attempt never became an NTLM logon. Repeats against one account look like guessing. The same failure across many accounts looks like spray. A pile of 0x25 (clock skew) is usually broken NTP, not an intruder."
+      },
+      {
+        id: 4776,
+        name: "The computer attempted to validate the credentials for an account",
+        source: "Security",
+        category: "Logon",
+        severity: "Watch",
+        explanation: "NTLM credential validation. A domain controller writes this when a member host asks it to check an NTLM response. Error code 0x0 is success. 0xC000006A is a wrong password. 0xC0000234 means the account is locked. The source workstation field is the host that asked.",
+        why: "NTLM is the path used for pass-the-hash and for NTLM relay. Useful leads are a server that should be Kerberos-only suddenly validating NTLM, and many failures from one workstation. Pair a success with 4624 logon type 3 on the target host to see which session resulted."
+      },
+      {
+        id: 1102,
+        name: "The audit log was cleared",
+        source: "Security",
+        category: "Defense Evasion",
+        severity: "High",
+        explanation: "The Security log was cleared. Windows writes 1102 into the new, empty log and records the account that cleared it. Events that were in the log before the clear are gone from that host.",
+        why: "Clearing the Security log is anti-forensics. Legitimate clears are rare and usually tied to a documented maintenance window. After 1102, assume you have lost earlier Security events on that machine and pivot to other hosts, System 7045, PowerShell 4104, and EDR."
+      },
+      {
+        id: 7045,
+        name: "A service was installed in the system",
+        source: "System",
+        category: "Persistence",
+        severity: "High",
+        explanation: "The Service Control Manager recorded a new service in the System log. The event includes the service name, the image path (Service File Name), the service type, the start type, and the account. It does not depend on Security auditing, so it is often present when 4697 is not.",
+        why: "Same persistence technique as Security 4697, and frequently the only copy you will have. Suspicious paths point at a user-writable directory, a network share, cmd.exe, or powershell.exe. Also suspect a service name that mimics a Windows component while the path does not match what that component actually ships."
+      },
+      {
+        id: 4104,
+        name: "Creating Scriptblock text",
+        source: "PowerShell",
+        category: "Process",
+        severity: "Watch",
+        explanation: "PowerShell script block logging wrote the script text the engine ran. It is event 4104 in Microsoft-Windows-PowerShell/Operational on the host that ran PowerShell, not in the Security log. A long script is split across several 4104 events that share a ScriptBlock ID. You only get this when script block logging is enabled.",
+        why: "You are looking at the code that actually executed, which is more useful than the command line alone, and often includes blocks after PowerShell has decoded them. Hunt for download cradles, encoded commands, and reflection aimed at AMSI. A known admin script from a console is fine. The same text under an Office parent or a remote session is not."
+      }
+    ];
+  </script>
+  <style>
+    :root {
+      --bg: #f2f3f5;
+      --card: #ffffff;
+      --text: #171a20;
+      --muted: #5d6672;
+      --faint: #7a8492;
+      --line: #e1e4e9;
+      --line-strong: #d3d8e0;
+      --chip: #ffffff;
+      --chip-text: #2c3340;
+      --chip-on: #171a20;
+      --chip-on-text: #ffffff;
+      --soft: #f7f8f9;
+      --mark: #1d4e89;
+      --shadow: 0 1px 2px rgba(23, 26, 32, 0.04);
+      --info-fg: #1a4d7c;
+      --info-bg: #e6f0f8;
+      --watch-fg: #7a4a09;
+      --watch-bg: #f8efd8;
+      --high-fg: #8d1c2c;
+      --high-bg: #fbe7ea;
+      --bar-info: #2f6fa8;
+      --bar-watch: #c4841d;
+      --bar-high: #c4384c;
+      --focus: #1d4e89;
+      color-scheme: light;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #111418;
+        --card: #1a1f27;
+        --text: #e8edf4;
+        --muted: #a5b1c0;
+        --faint: #8b98a8;
+        --line: #2c3440;
+        --line-strong: #3a4454;
+        --chip: #1a1f27;
+        --chip-text: #d5dde8;
+        --chip-on: #e8edf4;
+        --chip-on-text: #14181e;
+        --soft: #151a21;
+        --mark: #9ec0ef;
+        --shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+        --info-fg: #c5ddf5;
+        --info-bg: #1c3146;
+        --watch-fg: #f3d7a4;
+        --watch-bg: #3a2f1a;
+        --high-fg: #ffc6cd;
+        --high-bg: #45232a;
+        --bar-info: #6aa4dc;
+        --bar-watch: #e0a84a;
+        --bar-high: #ee7384;
+        --focus: #9ec0ef;
+        color-scheme: dark;
+      }
+    }
+
+    * { box-sizing: border-box; }
+
+    html {
+      -webkit-text-size-adjust: 100%;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+      font-size: 16px;
+      line-height: 1.5;
+    }
+
+    button, input {
+      font: inherit;
+      color: inherit;
+    }
+
+    .wrap {
+      width: min(720px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 28px 0 calc(40px + env(safe-area-inset-bottom));
+    }
+
+    header.page {
+      margin-bottom: 20px;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 1.65rem;
+      letter-spacing: -0.03em;
+      line-height: 1.15;
+      font-weight: 600;
+    }
+
+    .lede {
+      margin: 8px 0 0;
+      color: var(--muted);
+      font-size: 0.98rem;
+      max-width: 38em;
+    }
+
+    .toolbar {
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      background: var(--bg);
+      background: color-mix(in srgb, var(--bg) 92%, transparent);
+      backdrop-filter: blur(10px);
+      padding: 8px 0 12px;
+      margin: 0 0 8px;
+    }
+
+    .search {
+      position: relative;
+    }
+
+    label.search-label {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      border: 0;
+    }
+
+    #search {
+      width: 100%;
+      height: 48px;
+      padding: 0 44px 0 14px;
+      border: 1px solid var(--line-strong);
+      border-radius: 10px;
+      background: var(--card);
+      box-shadow: var(--shadow);
+      outline: none;
+    }
+
+    #search::-webkit-search-cancel-button,
+    #search::-webkit-search-decoration {
+      -webkit-appearance: none;
+      appearance: none;
+    }
+
+    #search::placeholder {
+      color: var(--muted);
+    }
+
+    #search:focus {
+      border-color: var(--focus);
+      box-shadow: 0 0 0 3px color-mix(in srgb, var(--focus) 28%, transparent);
+    }
+
+    #clear {
+      position: absolute;
+      top: 6px;
+      right: 6px;
+      width: 36px;
+      height: 36px;
+      border: 0;
+      border-radius: 8px;
+      background: transparent;
+      color: var(--muted);
+      cursor: pointer;
+    }
+
+    #clear:hover,
+    #clear:focus-visible {
+      background: var(--soft);
+      color: var(--text);
+    }
+
+    #clear[hidden] {
+      display: none;
+    }
+
+    .chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 12px 0 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .chips button {
+      min-height: 36px;
+      padding: 6px 12px;
+      border: 1px solid var(--line-strong);
+      border-radius: 999px;
+      background: var(--chip);
+      color: var(--chip-text);
+      cursor: pointer;
+    }
+
+    .chips button:hover {
+      border-color: var(--muted);
+    }
+
+    .chips button[aria-pressed="true"] {
+      background: var(--chip-on);
+      border-color: var(--chip-on);
+      color: var(--chip-on-text);
+    }
+
+    .chips button:focus-visible,
+    #clear:focus-visible {
+      outline: 2px solid var(--focus);
+      outline-offset: 2px;
+    }
+
+    .summary {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: baseline;
+      margin: 4px 0 12px;
+      color: var(--muted);
+      font-size: 0.86rem;
+    }
+
+    .legend {
+      margin: 0;
+      text-align: right;
+    }
+
+    .results {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-left: 3px solid var(--bar);
+      border-radius: 12px;
+      box-shadow: var(--shadow);
+      padding: 16px 16px 16px 18px;
+      scroll-margin-top: 11rem;
+    }
+
+    .card[data-severity="Info"] { --bar: var(--bar-info); }
+    .card[data-severity="Watch"] { --bar: var(--bar-watch); }
+    .card[data-severity="High"] { --bar: var(--bar-high); }
+
+    .card-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .eid {
+      font-family: "Cascadia Mono", "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+      font-size: 1.35rem;
+      font-weight: 600;
+      letter-spacing: -0.03em;
+      color: var(--mark);
+    }
+
+    .badge {
+      flex: none;
+      font-size: 0.75rem;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+      padding: 4px 8px;
+      border-radius: 999px;
+    }
+
+    .badge[data-severity="Info"] { color: var(--info-fg); background: var(--info-bg); }
+    .badge[data-severity="Watch"] { color: var(--watch-fg); background: var(--watch-bg); }
+    .badge[data-severity="High"] { color: var(--high-fg); background: var(--high-bg); }
+
+    .name {
+      margin: 6px 0 0;
+      font-size: 1.02rem;
+      line-height: 1.35;
+      font-weight: 600;
+      letter-spacing: -0.015em;
+    }
+
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 16px;
+      margin: 10px 0 0;
+      padding: 0;
+      list-style: none;
+      color: var(--muted);
+      font-size: 0.86rem;
+    }
+
+    .meta b {
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    .block {
+      margin-top: 14px;
+    }
+
+    .block h3 {
+      margin: 0 0 4px;
+      font-size: 0.72rem;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+
+    .block p {
+      margin: 0;
+    }
+
+    .lookup-table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 6px;
+      font-size: 0.92rem;
+    }
+
+    .lookup-table th,
+    .lookup-table td {
+      text-align: left;
+      padding: 7px 10px;
+      border-bottom: 1px solid var(--line);
+      vertical-align: baseline;
+    }
+
+    .lookup-table th {
+      font-size: 0.72rem;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+
+    .lookup-table td:first-child,
+    .lookup-table th:first-child {
+      width: 1%;
+      white-space: nowrap;
+      padding-left: 0;
+      padding-right: 18px;
+      font-family: "Cascadia Mono", "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .table-note {
+      margin: 12px 0 0;
+      font-size: 0.92rem;
+    }
+
+    .related {
+      margin: 6px 0 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .related li + li {
+      margin-top: 6px;
+    }
+
+    .related a {
+      font-family: "Cascadia Mono", "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+      font-weight: 600;
+      color: var(--mark);
+      text-decoration: none;
+    }
+
+    .related a:hover,
+    .related a:focus-visible {
+      text-decoration: underline;
+    }
+
+    .why {
+      background: var(--soft);
+      border-radius: 8px;
+      padding: 10px 12px;
+    }
+
+    .empty {
+      margin: 12px 0 0;
+      padding: 28px 16px;
+      text-align: center;
+      color: var(--muted);
+      border: 1px dashed var(--line-strong);
+      border-radius: 12px;
+      background: var(--card);
+    }
+
+    .empty strong {
+      display: block;
+      color: var(--text);
+      margin-bottom: 4px;
+    }
+
+    .error {
+      margin: 0 0 12px;
+      padding: 12px 14px;
+      border-radius: 10px;
+      background: var(--high-bg);
+      color: var(--high-fg);
+    }
+
+    @media (max-width: 540px) {
+      .wrap {
+        width: min(720px, calc(100% - 24px));
+        padding-top: 20px;
+      }
+
+      h1 { font-size: 1.45rem; }
+
+      .summary {
+        flex-direction: column;
+        gap: 2px;
+      }
+
+      .legend { text-align: left; }
+
+      .eid { font-size: 1.25rem; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header class="page">
+      <h1>Event ID Decoder</h1>
+      <p class="lede">Look up a Windows event ID or a keyword. Plain language for the security events SOC analysts triage.</p>
+    </header>
+
+    <div class="toolbar">
+      <div class="search">
+        <label class="search-label" for="search">Search by event ID or keyword</label>
+        <input id="search" type="search" inputmode="search" enterkeyhint="search" spellcheck="false" autocomplete="off" placeholder="Event ID or keyword — 4625, logon, kerberos">
+        <button id="clear" type="button" hidden aria-label="Clear search">×</button>
+      </div>
+      <ul class="chips" id="chips" role="list"></ul>
+    </div>
+
+    <div class="summary">
+      <p id="count" aria-live="polite"></p>
+      <p class="legend">Severity to investigate: Info, Watch, High</p>
+    </div>
+
+    <div id="notice"></div>
+    <div class="results" id="results"></div>
+  </div>
+
+  <script>
+    const REQUIRED = ["id", "name", "source", "category", "severity", "explanation", "why"];
+    const SEVERITIES = new Set(["Info", "Watch", "High"]);
+    const CATEGORY_ORDER = [
+      "Logon",
+      "Account Management",
+      "Kerberos",
+      "Process",
+      "Persistence",
+      "Defense Evasion"
+    ];
+
+    const searchInput = document.getElementById("search");
+    const clearButton = document.getElementById("clear");
+    const chipsEl = document.getElementById("chips");
+    const countEl = document.getElementById("count");
+    const noticeEl = document.getElementById("notice");
+    const resultsEl = document.getElementById("results");
+
+    let activeCategory = "All";
+
+    function problemsIn(events) {
+      const found = [];
+      events.forEach((event, index) => {
+        const id = event && event.id !== undefined ? event.id : "entry " + (index + 1);
+        REQUIRED.forEach((key) => {
+          if (!event || event[key] === undefined || event[key] === "") {
+            found.push(id + " is missing " + key + ".");
+          }
+        });
+        if (event && event.severity && !SEVERITIES.has(event.severity)) {
+          found.push(id + " has severity “" + event.severity + "”. Use Info, Watch, or High.");
+        }
+      });
+      return found;
+    }
+
+    function categoriesIn(events) {
+      const present = new Set(events.map((event) => event.category));
+      const ordered = CATEGORY_ORDER.filter((category) => present.has(category));
+      present.forEach((category) => {
+        if (!ordered.includes(category)) ordered.push(category);
+      });
+      return ["All", ...ordered];
+    }
+
+    function haystack(event) {
+      return [
+        String(event.id),
+        event.name,
+        event.source,
+        event.category,
+        event.severity,
+        event.explanation,
+        event.why,
+        ...(event.logonTypes || []).flatMap((row) => [String(row.type), row.name, row.note || ""]),
+        ...(event.statusCodes || []).flatMap((row) => [row.code, row.meaning]),
+        event.statusNote || "",
+        ...(event.related || []).flatMap((id) => {
+          const related = EVENTS.find((item) => item.id === id);
+          return [String(id), related ? related.name : ""];
+        })
+      ].join("\n").toLowerCase();
+    }
+
+    function matching(events) {
+      const tokens = searchInput.value.trim().toLowerCase().split(/\s+/).filter(Boolean);
+      return events
+        .filter((event) => activeCategory === "All" || event.category === activeCategory)
+        .filter((event) => {
+          if (tokens.length === 0) return true;
+          const text = haystack(event);
+          return tokens.every((token) => {
+            if (/^\d+$/.test(token)) return String(event.id).startsWith(token);
+            return text.includes(token);
+          });
+        })
+        .slice()
+        .sort((a, b) => a.id - b.id);
+    }
+
+    function el(tag, className, text) {
+      const node = document.createElement(tag);
+      if (className) node.className = className;
+      if (text !== undefined) node.textContent = text;
+      return node;
+    }
+
+    function renderChips(events) {
+      chipsEl.replaceChildren();
+      categoriesIn(events).forEach((category) => {
+        const item = document.createElement("li");
+        const button = document.createElement("button");
+        button.type = "button";
+        button.textContent = category;
+        button.setAttribute("aria-pressed", String(category === activeCategory));
+        button.addEventListener("click", () => {
+          activeCategory = category;
+          render();
+        });
+        item.appendChild(button);
+        chipsEl.appendChild(item);
+      });
+    }
+
+    function renderCard(event) {
+      const card = el("article", "card");
+      card.id = "event-" + event.id;
+      card.dataset.severity = event.severity;
+
+      const top = el("div", "card-top");
+      top.appendChild(el("p", "eid", String(event.id)));
+      const badge = el("p", "badge", event.severity);
+      badge.dataset.severity = event.severity;
+      badge.title = "Severity to investigate";
+      top.appendChild(badge);
+
+      const meta = el("ul", "meta");
+      [["Log", event.source], ["Category", event.category]].forEach(([label, value]) => {
+        const item = document.createElement("li");
+        item.append(label + " ", el("b", "", value));
+        meta.appendChild(item);
+      });
+
+      const meaning = el("div", "block");
+      meaning.appendChild(el("h3", "", "What it means"));
+      meaning.appendChild(el("p", "", event.explanation));
+
+      const why = el("div", "block why");
+      why.appendChild(el("h3", "", "Why an analyst cares"));
+      why.appendChild(el("p", "", event.why));
+
+      const name = el("h2", "name", event.name);
+      const parts = [top, name, meta, meaning];
+      if (event.logonTypes && event.logonTypes.length) {
+        parts.push(renderLookupTable(
+          "Logon types",
+          ["Type", "Name"],
+          event.logonTypes.map((row) => [String(row.type), row.name]),
+          event.logonTypes.filter((row) => row.note).map((row) => row.note).join(" ")
+        ));
+      }
+      if (event.statusCodes && event.statusCodes.length) {
+        parts.push(renderLookupTable(
+          "Failure status codes",
+          ["Code", "Meaning"],
+          event.statusCodes.map((row) => [row.code, row.meaning]),
+          event.statusNote || ""
+        ));
+      }
+      parts.push(why);
+      if (event.related && event.related.length) {
+        parts.push(renderRelated(event.related));
+      }
+      card.append(...parts);
+      return card;
+    }
+
+    function renderLookupTable(title, headers, rows, note) {
+      const block = el("div", "block");
+      block.appendChild(el("h3", "", title));
+      const table = el("table", "lookup-table");
+      const headRow = document.createElement("tr");
+      headers.forEach((label) => {
+        const cell = el("th", "", label);
+        cell.scope = "col";
+        headRow.appendChild(cell);
+      });
+      const thead = document.createElement("thead");
+      thead.appendChild(headRow);
+      const tbody = document.createElement("tbody");
+      rows.forEach((row) => {
+        const tr = document.createElement("tr");
+        row.forEach((value) => tr.appendChild(el("td", "", value)));
+        tbody.appendChild(tr);
+      });
+      table.append(thead, tbody);
+      block.appendChild(table);
+      if (note) block.appendChild(el("p", "table-note", note));
+      return block;
+    }
+
+    function renderRelated(ids) {
+      const block = el("div", "block");
+      block.appendChild(el("h3", "", "Related events"));
+      const list = el("ul", "related");
+      ids.forEach((id) => {
+        const match = EVENTS.find((item) => item.id === id);
+        const item = document.createElement("li");
+        const link = document.createElement("a");
+        link.href = "#event-" + id;
+        link.textContent = String(id);
+        link.addEventListener("click", (click) => {
+          click.preventDefault();
+          showEvent(id);
+        });
+        item.appendChild(link);
+        if (match) item.append(" " + match.name);
+        list.appendChild(item);
+      });
+      block.appendChild(list);
+      return block;
+    }
+
+    function showEvent(id) {
+      activeCategory = "All";
+      searchInput.value = String(id);
+      render();
+      const card = document.getElementById("event-" + id);
+      if (card) card.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+
+    function renderEmpty(query) {
+      const box = el("div", "empty");
+      const title = el("strong", "", "No matching events");
+      const detail = el("p", "");
+      detail.textContent = query
+        ? "Nothing in this set matches “" + query + "”."
+        : "Nothing in this category yet.";
+      box.append(title, detail);
+      return box;
+    }
+
+    function render() {
+      const issues = problemsIn(EVENTS);
+      noticeEl.replaceChildren();
+      if (issues.length) {
+        const banner = el("div", "error");
+        banner.appendChild(el("strong", "", "Check the EVENTS array"));
+        const list = document.createElement("ul");
+        issues.forEach((issue) => list.appendChild(el("li", "", issue)));
+        banner.appendChild(list);
+        noticeEl.appendChild(banner);
+      }
+
+      renderChips(EVENTS);
+      const query = searchInput.value.trim();
+      clearButton.hidden = query.length === 0;
+      const shown = matching(EVENTS);
+
+      const noun = shown.length === 1 ? "event" : "events";
+      const verb = shown.length === 1 ? "matches" : "match";
+      countEl.textContent = query
+        ? shown.length + " " + noun + " " + verb
+        : shown.length + " " + noun;
+
+      resultsEl.replaceChildren();
+      if (shown.length === 0) {
+        resultsEl.appendChild(renderEmpty(query));
+        return;
+      }
+      shown.forEach((event) => resultsEl.appendChild(renderCard(event)));
+    }
+
+    searchInput.addEventListener("input", render);
+    clearButton.addEventListener("click", () => {
+      searchInput.value = "";
+      searchInput.focus();
+      render();
+    });
+
+    if (window.matchMedia("(min-width: 800px)").matches) {
+      searchInput.focus();
+    }
+
+    render();
+  </script>
+</body>
+</html>
