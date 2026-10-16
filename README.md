@@ -4,6 +4,8 @@ A searchable, single-page reference for Windows Security event IDs, written in p
 
 Each event card explains what the event means, why an analyst should care, how urgent it usually is, and which events to check next.
 
+**Live demo:** https://tash925.github.io/event-id-decoder/
+
 ## Features
 
 - Search by event ID (e.g., `4625`) or keyword (e.g., `kerberos`)
